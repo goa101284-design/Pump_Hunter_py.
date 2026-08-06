@@ -1,0 +1,594 @@
+import asyncio
+import logging
+import os
+import time
+import datetime
+import numpy as np
+import pandas as pd
+from aiohttp import web
+import aiohttp
+
+# =====================================================================
+# ⚙️ НАСТРОЙКИ И КОНФИГУРАЦИЯ
+# =====================================================================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    raise ValueError("❌ Не заданы TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID")
+
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+
+BINGX_BASE_URL = "https://open-api.bingx.com"
+MIN_24H_VOLUME_USDT = 80000
+SCAN_INTERVAL_SECONDS = 30
+
+FULL_SCAN_INTERVAL_SECONDS = 3600
+IDEAL_ENTRY_MINUTES = (49, 56)
+
+BLACKLIST_FILE = "blacklist.txt"
+SIGNAL_CACHE = {}
+COOLDOWN_SECONDS = 1800
+
+WATCHLIST = {}
+
+# Настройка прозрачного логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+
+# =====================================================================
+# 🚫 УПРАВЛЕНИЕ ЧЁРНЫМ СПИСКОМ
+# =====================================================================
+def load_blacklist():
+    coins = {"USDT", "USDC", "BUSD", "EUR", "GBP", "DAI", "TUSD"}
+    if os.path.exists(BLACKLIST_FILE):
+        try:
+            with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    c = line.strip().upper()
+                    if c and not c.startswith("#"):
+                        coins.add(c)
+        except Exception as e:
+            logging.error(f"❌ Ошибка загрузки blacklist: {e}")
+    return coins
+
+
+def save_to_blacklist(coin_name: str):
+    coin = coin_name.strip().upper()
+    try:
+        with open(BLACKLIST_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{coin}\n")
+    except Exception as e:
+        logging.error(f"❌ Ошибка сохранения в blacklist: {e}")
+
+
+def remove_from_blacklist(coin_name: str):
+    coin = coin_name.strip().upper()
+    coins = load_blacklist()
+    coins.discard(coin)
+    try:
+        with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
+            for c in coins:
+                if c not in ["USDT", "USDC", "BUSD", "EUR", "GBP", "DAI", "TUSD"]:
+                    f.write(f"{c}\n")
+    except Exception as e:
+        logging.error(f"❌ Ошибка удаления из blacklist: {e}")
+
+
+# =====================================================================
+# 📡 BINGX API & TELEGRAM COMMANDS
+# =====================================================================
+async def send_telegram_message(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=10) as resp:
+                if resp.status != 200:
+                    logging.error(f"❌ Ошибка отправки Telegram: Status {resp.status} - {await resp.text()}")
+    except Exception as e:
+        logging.error(f"❌ Исключение Telegram: {e}")
+
+
+async def handle_telegram_commands():
+    offset = 0
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                params = {"offset": offset, "timeout": 10}
+                async with session.get(url, params=params, timeout=12) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for update in data.get("result", []):
+                            offset = update["update_id"] + 1
+                            message = update.get("message", {})
+                            text = message.get("text", "").strip()
+                            chat_id = str(message.get("chat", {}).get("id", ""))
+
+                            if chat_id != str(TELEGRAM_CHAT_ID):
+                                continue
+
+                            if text.startswith("/block") or text.startswith("/ban"):
+                                parts = text.split()
+                                if len(parts) > 1:
+                                    coin = parts[1].replace("#", "").replace("-USDT", "").replace("USDT", "").upper()
+                                    save_to_blacklist(coin)
+                                    symbol_key = f"{coin}-USDT"
+                                    if symbol_key in WATCHLIST:
+                                        del WATCHLIST[symbol_key]
+                                    await send_telegram_message(f"🚫 **Монета #{coin} добавлена в Чёрный Список!**")
+                                else:
+                                    await send_telegram_message("⚠️ Пример: `/block ESPORT`")
+
+                            elif text.startswith("/unblock"):
+                                parts = text.split()
+                                if len(parts) > 1:
+                                    coin = parts[1].replace("#", "").replace("-USDT", "").replace("USDT", "").upper()
+                                    remove_from_blacklist(coin)
+                                    await send_telegram_message(f"✅ **Монета #{coin} удалена из Чёрного Списка.**")
+                                else:
+                                    await send_telegram_message("⚠️ Пример: `/unblock ESPORT`")
+
+                            elif text == "/blacklist":
+                                current_list = load_blacklist()
+                                custom_coins = [c for c in current_list if c not in ["USDT", "USDC", "BUSD", "EUR", "GBP", "DAI", "TUSD"]]
+                                if custom_coins:
+                                    coins_str = ", ".join([f"`{c}`" for c in custom_coins])
+                                    await send_telegram_message(f"📜 **Чёрный список:**\n{coins_str}")
+                                else:
+                                    await send_telegram_message("📜 Чёрный список пуст.")
+
+            except Exception as e:
+                logging.error(f"❌ Ошибка в Telegram командах: {e}")
+
+            await asyncio.sleep(3)
+
+
+async def get_active_usdt_pairs(session):
+    url = f"{BINGX_BASE_URL}/openApi/swap/v2/quote/ticker"
+    exclude_set = load_blacklist()
+    try:
+        async with session.get(url, timeout=10) as resp:
+            res = await resp.json()
+            if res.get("code") == 0:
+                data = res.get("data", [])
+                valid = []
+                for item in data:
+                    symbol = item.get("symbol", "")
+                    vol = float(item.get("quoteVolume", 0))
+
+                    if not symbol.endswith("-USDT"): continue
+                    base_coin = symbol.split("-")[0].upper()
+                    if base_coin in exclude_set: continue
+
+                    if vol >= MIN_24H_VOLUME_USDT:
+                        valid.append(symbol)
+                logging.info(f"🌐 Отобрано {len(valid)} активных пар с объемом >= ${MIN_24H_VOLUME_USDT}")
+                return valid
+            else:
+                logging.error(f"❌ BingX API Ticker Ошибка: Code {res.get('code')}, Msg: {res.get('msg')}")
+    except Exception as e:
+        logging.error(f"❌ Ошибка получения списка пар с BingX: {e}")
+    return []
+
+
+async def get_klines(session, symbol: str, interval: str, limit: int = 80):
+    url = f"{BINGX_BASE_URL}/openApi/swap/v3/quote/klines"
+    params = {"symbol": symbol.replace("-", ""), "interval": interval, "limit": limit}
+    try:
+        async with session.get(url, params=params, timeout=10) as resp:
+            res = await resp.json()
+            if res.get("code") == 0:
+                data = res.get("data", [])
+                if data:
+                    data.reverse()
+                return data
+            else:
+                logging.warning(f"⚠️ Ошибка Klines [{symbol}]: Code {res.get('code')}")
+    except Exception as e:
+        logging.error(f"❌ Исключение Klines [{symbol}]: {e}")
+    return []
+
+
+# =====================================================================
+# 🧠 АНАЛИТИЧЕСКИЙ БЛОК
+# =====================================================================
+def calculate_ema(closes, period):
+    if len(closes) < period: return closes[-1]
+    return pd.Series(closes).ewm(span=period, adjust=False).mean().iloc[-1]
+
+
+def find_base_params(klines_1h, min_hours, max_hours, max_width):
+    closed = klines_1h[:-1]
+
+    for w in range(max_hours, min_hours - 1, -2):
+        if len(closed) < w: continue
+        recent = closed[-w:]
+        highs = [float(k[2]) for k in recent]
+        lows = [float(k[3]) for k in recent]
+        vols = [float(k[5]) * float(k[4]) for k in recent]
+
+        range_high = max(highs)
+        range_low = min(lows)
+        if range_low <= 0: continue
+
+        flat_width = ((range_high - range_low) / range_low) * 100
+        quiet_vol = np.median(vols) if vols else 0.0
+
+        if flat_width <= max_width and quiet_vol > 0:
+            return True, round(flat_width, 2), range_high, range_low, w, quiet_vol
+
+    return False, 0.0, 0.0, 0.0, 0, 0.0
+
+
+def check_ema_bounce(klines_1h, range_high, range_low):
+    closes = [float(k[4]) for k in klines_1h]
+    ema20 = calculate_ema(closes, 20)
+    ema40 = calculate_ema(closes, 40)
+
+    ema20_in = range_low <= ema20 <= range_high
+    ema40_in = range_low <= ema40 <= range_high
+
+    if not (ema20_in or ema40_in): return None, 0, ""
+
+    dist = abs((ema20 - ema40) / ema40) * 100 if ema40 > 0 else 100
+    squeezed = dist <= 3.0
+
+    curr = klines_1h[-1]
+    close_h = float(curr[4])
+
+    prev = klines_1h[-5:-1]
+    touched20 = any(abs(float(c[3]) - ema20) / ema20 * 100 <= 1.8 or abs(float(c[4]) - ema20) / ema20 * 100 <= 1.8 for c in prev)
+    touched40 = any(abs(float(c[3]) - ema40) / ema40 * 100 <= 1.8 or abs(float(c[4]) - ema40) / ema40 * 100 <= 1.8 for c in prev)
+
+    above20 = close_h > ema20
+    above40 = close_h > ema40
+
+    if touched20 and touched40 and (above20 or above40):
+        score = 30
+        detail = "🔥 Опора на EMA20+EMA40 (+30)"
+        if squeezed:
+            score += 15
+            detail += f" | Сжатие EMA {dist:.1f}% (+15)"
+        return "DUAL_EMA", score, detail
+
+    if touched40 and above40: return "EMA40", 25, "🦾 Опора на EMA40 (+25)"
+    if touched20 and above20: return "EMA20", 20, "💪 Опора на EMA20 (+20)"
+
+    return None, 0, ""
+
+
+def evaluate_realtime_signal(klines_1h):
+    if len(klines_1h) < 24: return None
+
+    curr = klines_1h[-1]
+    open_h, high_h, low_h, close_h = float(curr[1]), float(curr[2]), float(curr[3]), float(curr[4])
+    vol_h = float(curr[5]) * close_h
+
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    elapsed = now_dt.minute + now_dt.second / 60
+    if elapsed < 1: elapsed = 1
+
+    change_pct = ((close_h - open_h) / open_h) * 100
+    candle_range = ((high_h - low_h) / low_h) * 100
+
+    past_vols = [float(k[5]) * float(k[4]) for k in klines_1h[-21:-1]]
+    avg_vol = np.mean(past_vols) if past_vols else 1.0
+    projected_vol = vol_h * (60 / elapsed)
+    rvol = projected_vol / avg_vol if avg_vol > 0 else 1.0
+
+    closes = [float(k[4]) for k in klines_1h]
+    ema20_val = calculate_ema(closes, 20)
+
+    # Поиск базы
+    is_flat, width, range_h, range_l, hours, _ = find_base_params(klines_1h, 4, 12, 8.0)
+    if not is_flat:
+        is_flat, width, range_h, range_l, hours, _ = find_base_params(klines_1h, 12, 48, 10.0)
+    if not is_flat:
+        is_flat, width, range_h, range_l, hours, _ = find_base_params(klines_1h, 24, 72, 12.0)
+
+    ema_type, ema_score, ema_detail = check_ema_bounce(klines_1h, range_h, range_l) if is_flat else (None, 0, "")
+    ema_detail = ema_detail if ema_type else ""
+
+    # 1. Скрытая мышь
+    if is_flat and len(klines_1h) >= 9:
+        last = klines_1h[-8:-1]
+        hist_ranges = [(float(k[2]) - float(k[3])) / float(k[3]) * 100 for k in last]
+        hist_bodies = [abs(float(k[4]) - float(k[1])) / float(k[1]) * 100 for k in last]
+        hist_money = [float(k[5]) * float(k[4]) for k in last]
+        hist_closes = [float(k[4]) for k in last]
+
+        avg_money = np.mean(hist_money) if hist_money else 0.0
+        avg_close = np.mean(hist_closes) if hist_closes else 0.0
+
+        stable_count = sum(1 for m in hist_money if 0.5 * avg_money <= m <= 1.5 * avg_money) if avg_money > 0 else 0
+        close_deviations = [abs(c - avg_close) / avg_close * 100 for c in hist_closes] if avg_close > 0 else [100]
+
+        quiet_history = (
+            np.mean(hist_ranges) <= 3.5 and
+            np.mean(hist_bodies) <= 2.0 and
+            stable_count >= 4 and
+            max(close_deviations) <= 1.2
+        )
+
+        body_pct = abs(close_h - open_h) / open_h * 100
+
+        if quiet_history and candle_range <= 2.0 and body_pct <= 1.0 and 0.8 <= rvol <= 2.5:
+            return {
+                "type": "QUIET_ACCUMULATION",
+                "score": 90,
+                "price": close_h,
+                "change_1h": round(change_pct, 2),
+                "rvol": round(rvol, 1),
+                "hours": hours,
+                "width": width,
+                "elapsed": int(elapsed),
+                "reasons": [
+                    "🐭 **Затаившаяся мышь:** Набор позиции без шума в стакане!",
+                    f"📊 **Поток денег:** {stable_count}/7 свечей в коридоре",
+                    f"🕯 **Анатомия H1:** Диапазон `{candle_range:.2f}%` | RVOL `x{round(rvol,1)}`"
+                ]
+            }
+
+    # 2. Сценарий 49-56 мин
+    if is_flat and (IDEAL_ENTRY_MINUTES[0] <= int(elapsed) <= IDEAL_ENTRY_MINUTES[1]):
+        if change_pct <= 2.5 and rvol >= 1.2 and close_h > ema20_val:
+            return {
+                "type": "H1_BREAKOUT",
+                "score": 90,
+                "reasons": [
+                    f"🎯 **ЗАЛИВ В БАЗЕ ({int(elapsed)}я мин):** RVOL x{round(rvol,1)}, цена еще в накоплении (+{round(change_pct,2)}%)!",
+                    f"📦 База: {hours}ч (ширина {width}%)",
+                    ema_detail if ema_detail else "🧲 Накопление выше EMA20"
+                ],
+                "price": close_h,
+                "change_1h": round(change_pct, 2),
+                "rvol": round(rvol, 1),
+                "width": width,
+                "hours": hours,
+                "elapsed": int(elapsed),
+                "ema_type": ema_type,
+                "is_dangerous": False
+            }
+
+    # 3. Первая импульсная свеча из базы
+    if is_flat and change_pct >= 0.6 and rvol >= 0.8:
+        is_dangerous = change_pct > 7.0
+        return {
+            "type": "H1_BREAKOUT",
+            "score": 85,
+            "reasons": [
+                f"🚀 **ПЕРВАЯ ИМПУЛЬСНАЯ СВЕЧА ({int(elapsed)}-я мин):** Старт движения из базы!",
+                f"📊 Импульс: +{round(change_pct,2)}% | Проекция RVOL: x{round(rvol,1)}",
+                f"📦 Выход из базы: {hours}ч (ширина {width}%)",
+                ema_detail if ema_detail else ""
+            ],
+            "price": close_h,
+            "change_1h": round(change_pct, 2),
+            "rvol": round(rvol, 1),
+            "width": width,
+            "hours": hours,
+            "elapsed": int(elapsed),
+            "ema_type": ema_type,
+            "is_dangerous": is_dangerous
+        }
+
+    # 4. Плавный нарастающий памп
+    if change_pct >= 0.8 and rvol >= 1.3 and vol_h >= 10000:
+        return {
+            "type": "SMOOTH_PUMP",
+            "score": 80 if is_flat else 65,
+            "reasons": [
+                f"📈 **ПЛАВНЫЙ ПАМП ({int(elapsed)}-я мин):** Разгон объема!",
+                f"📊 Динамика: +{round(change_pct,2)}% | RVOL: x{round(rvol,1)}",
+                f"📦 Из базы: {hours}ч" if is_flat else "⚠️ Вне базы флэта"
+            ],
+            "price": close_h,
+            "change_1h": round(change_pct, 2),
+            "rvol": round(rvol, 1),
+            "width": width if is_flat else 0,
+            "hours": hours if is_flat else 0,
+            "elapsed": int(elapsed),
+            "ema_type": ema_type,
+            "is_dangerous": False
+        }
+
+    # 5. Всплеск объема
+    if change_pct >= 2.2 and rvol >= 1.8:
+        is_dangerous = change_pct > 7.5
+        return {
+            "type": "VOLUME_PUMP",
+            "score": 70,
+            "reasons": [
+                f"💥 **ОБЪЕМНЫЙ ИМПУЛЬС ({int(elapsed)}-я мин):** Всплеск объема!",
+                f"🔥 Рост: +{round(change_pct,2)}% | RVOL: x{round(rvol,1)}",
+                f"📦 База: {hours}ч" if is_flat else "⚠️ Без базы флэта"
+            ],
+            "price": close_h,
+            "change_1h": round(change_pct, 2),
+            "rvol": round(rvol, 1),
+            "width": width if is_flat else 0,
+            "hours": hours if is_flat else 0,
+            "elapsed": int(elapsed),
+            "ema_type": None,
+            "is_dangerous": is_dangerous
+        }
+
+    # 6. Импульс без базы
+    if not is_flat and change_pct >= 1.0 and rvol >= 1.5:
+        return {
+            "type": "IMPULSE_NO_BASE",
+            "score": 60,
+            "reasons": [
+                f"⚡ **ИМПУЛЬС БЕЗ БАЗЫ ({int(elapsed)}-я мин):** Рост объема!",
+                f"📊 Импульс: +{round(change_pct,2)}% | RVOL: x{round(rvol,1)}",
+                "⚠️ Без подтвержденной базы флэта"
+            ],
+            "price": close_h,
+            "change_1h": round(change_pct, 2),
+            "rvol": round(rvol, 1),
+            "width": 0,
+            "hours": 0,
+            "elapsed": int(elapsed),
+            "ema_type": None,
+            "is_dangerous": False
+        }
+
+    return None
+
+
+# =====================================================================
+# 🔄 ГЛАВНЫЙ ЦИКЛ СКАНИРОВАНИЯ С ПОЛНЫМ ЛОГИРОВАНИЕМ
+# =====================================================================
+async def process_symbol(session, symbol, now_ts):
+    klines_1h = await get_klines(session, symbol, "1h", limit=80)
+    if not klines_1h or len(klines_1h) < 24:
+        return None
+
+    signal = evaluate_realtime_signal(klines_1h)
+    if not signal:
+        return None
+
+    cache_key = f"{symbol}_{signal['type']}"
+    if cache_key in SIGNAL_CACHE and now_ts - SIGNAL_CACHE[cache_key] < COOLDOWN_SECONDS:
+        return None
+
+    SIGNAL_CACHE[cache_key] = now_ts
+    return symbol, signal
+
+
+async def scan_market():
+    global SIGNAL_CACHE, WATCHLIST
+    logging.info("🚀 Сканер H1 запущен и готов к работе!")
+    last_full_scan_time = 0
+
+    async with aiohttp.ClientSession() as session:
+        await send_telegram_message("🤖 **Сканер перезапущен с полным логированием!**")
+
+        while True:
+            start_time = time.time()
+            now_ts = start_time
+
+            try:
+                # Обновление списка активных пар 1 раз в час
+                if now_ts - last_full_scan_time > FULL_SCAN_INTERVAL_SECONDS or not WATCHLIST:
+                    all_symbols = await get_active_usdt_pairs(session)
+                    SIGNAL_CACHE = {k: v for k, v in SIGNAL_CACHE.items() if now_ts - v < COOLDOWN_SECONDS * 2}
+
+                    if all_symbols:
+                        WATCHLIST = {symbol: {"status": "ACTIVE"} for symbol in all_symbols}
+                        last_full_scan_time = now_ts
+                        logging.info(f"🔄 Список монет обновлен. В работе: {len(WATCHLIST)} монет.")
+                    else:
+                        logging.warning("⚠️ Не удалось загрузить список пар! Повтор через 10 секунд...")
+                        await asyncio.sleep(10)
+                        continue
+
+                symbols_list = list(WATCHLIST.keys())
+                total_symbols = len(symbols_list)
+                signals_found = 0
+
+                # Батчевая асинхронная обработка (по 15 монет одновременно)
+                batch_size = 15
+                for i in range(0, total_symbols, batch_size):
+                    batch = symbols_list[i:i + batch_size]
+                    tasks = [process_symbol(session, sym, now_ts) for sym in batch]
+                    results = await asyncio.gather(*tasks)
+
+                    for res in results:
+                        if res:
+                            symbol, signal = res
+                            signals_found += 1
+                            clean = symbol.replace("-USDT", "")
+                            reasons_fmt = "\n".join([f"• {r}" for r in signal["reasons"] if r])
+
+                            if signal["type"] == "QUIET_ACCUMULATION":
+                                msg = (
+                                    f"🚨 **🔍 СКРЫТЫЙ АЛГОРИТМИЧЕСКИЙ ЗАКУП**\n\n"
+                                    f"📌 **Монета:** #{clean} / USDT\n"
+                                    f"💵 **Текущая цена:** `{signal['price']}`\n"
+                                    f"📊 **Изменение H1:** `{signal['change_1h']}%`\n"
+                                    f"📈 **Проекция RVOL:** `x{signal['rvol']}`\n"
+                                    f"⏰ **Минута часа:** `{signal['elapsed']} из 60`\n"
+                                    f"📦 **База:** `{signal['hours']}ч` (ширина `{signal['width']}%`)\n"
+                                    f"⭐ **Скор:** `{signal['score']}/100`\n\n"
+                                    f"🔍 **Анализ паттерна:**\n{reasons_fmt}\n\n"
+                                    f"🔗 [Открыть график](https://bingx.com/ru-ru/futures/forward/{clean}USDT/)"
+                                )
+                            else:
+                                ema_label = f"\n🧲 **Сетап:** {signal['ema_type']}" if signal.get("ema_type") else ""
+                                danger_header = "⚠️ **[ВХОД ОПАСЕН — АГРЕССИВНАЯ СВЕЧА]**\n" if signal.get("is_dangerous") else ""
+
+                                msg = (
+                                    f"{danger_header}"
+                                    f"⚡ **BINGX: REAL-TIME H1 СИГНАЛ**\n\n"
+                                    f"📌 **Монета:** #{clean} / USDT\n"
+                                    f"💵 **Текущая цена:** `{signal['price']}`\n"
+                                    f"📊 **Рост за час:** `+{signal['change_1h']}%`\n"
+                                    f"📈 **Проекция RVOL:** `x{signal['rvol']}`\n"
+                                    f"⏰ **Минута часа:** `{signal['elapsed']} из 60`\n"
+                                    f"📦 **База:** `{signal['hours']}ч` (ширина `{signal['width']}%`)\n"
+                                    f"⭐ **Скор:** `{signal['score']}/100`{ema_label}\n\n"
+                                    f"🔍 **Факторы:**\n{reasons_fmt}\n\n"
+                                    f"🔗 [Открыть график](https://bingx.com/ru-ru/futures/forward/{clean}USDT/)"
+                                )
+
+                            await send_telegram_message(msg)
+                            logging.info(f"🔥 СИГНАЛ ОТПРАВЛЕН [{signal['type']}]: {symbol}")
+
+                    await asyncio.sleep(0.1) # Микро-пауза для защиты от лимитов API
+
+                duration = round(time.time() - start_time, 2)
+                # 💓 HEARTBEAT LOG: Показывает, что бот реально живет
+                logging.info(f"💓 [HEARTBEAT] Круг завершен за {duration}сек | Обработано монет: {total_symbols} | Найдено сигналов: {signals_found}")
+
+            except Exception as e:
+                logging.error(f"❌ Ошибка в главном цикле: {e}", exc_info=True)
+
+            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+
+# =====================================================================
+# 🌐 ВЕБ-СЕРВЕР
+# =====================================================================
+async def health(request):
+    return web.Response(text=f"Scanner Active. Coins in watchlist: {len(WATCHLIST)}", status=200)
+
+async def self_ping():
+    await asyncio.sleep(30)
+    if not RENDER_EXTERNAL_URL: return
+    async with aiohttp.ClientSession() as s:
+        while True:
+            try:
+                async with s.get(RENDER_EXTERNAL_URL) as r: pass
+            except Exception: pass
+            await asyncio.sleep(600)
+
+async def main():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    port = int(os.getenv("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+
+    logging.info(f"🌐 Веб-сервер запущен на порту {port}")
+
+    asyncio.create_task(self_ping())
+    asyncio.create_task(handle_telegram_commands())
+    await scan_market()
+
+if __name__ == "__main__":
+    asyncio.run(main())
