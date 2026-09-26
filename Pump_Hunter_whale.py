@@ -1,0 +1,572 @@
+import asyncio
+import aiohttp
+from aiohttp import web
+import os
+import time
+import gc
+import logging
+from collections import defaultdict, deque
+from html import escape
+
+# ============================================================
+# ПАМП-ХАНТЕР v10.3 — Grind-15m Edition (ранний подтверждённый разгон)
+# ============================================================
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
+PORT = int(os.environ.get("PORT", "10000"))
+
+# --- Периодика ---
+SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "90"))
+OI_SAMPLE_INTERVAL_SEC = int(os.environ.get("OI_SAMPLE_INTERVAL_SEC", "900"))
+UNIVERSE_REFRESH_SEC = int(os.environ.get("UNIVERSE_REFRESH_SEC", "900"))
+
+MAX_UNIVERSE_SYMBOLS = int(os.environ.get("MAX_UNIVERSE_SYMBOLS", "200"))
+MAX_SCAN_CANDIDATES = int(os.environ.get("MAX_SCAN_CANDIDATES", "150"))
+
+MIN_24H_VOLUME_USDT = float(os.environ.get("MIN_24H_VOLUME_USDT", "300000"))
+
+MIN_PRICE_USDT = float(os.environ.get("MIN_PRICE_USDT", "0.001"))
+MAX_PRICE_USDT = float(os.environ.get("MAX_PRICE_USDT", "1.0"))
+MIN_LISTING_AGE_DAYS = float(os.environ.get("MIN_LISTING_AGE_DAYS", "14"))
+
+# === GRIND — ранний подтверждённый разгон на 15м свечах ===
+GRIND_ENABLED = os.environ.get("GRIND_ENABLED", "true").lower() == "true"
+MIN_GRIND_PCT = float(os.environ.get("MIN_GRIND_PCT", "4.0"))          # рост за окно, %
+GRIND_WINDOW_CANDLES = int(os.environ.get("GRIND_WINDOW_CANDLES", "4"))  # сколько 15м свечей = 1 час
+GRIND_MIN_GREEN = int(os.environ.get("GRIND_MIN_GREEN", "3"))          # мин. зелёных в окне (из 4)
+GRIND_LOOKBACK_HOURS = int(os.environ.get("GRIND_LOOKBACK_HOURS", "24"))  # база для пробоя
+MIN_GRIND_RVOL = float(os.environ.get("MIN_GRIND_RVOL", "2.0"))
+GRIND_CANDLE_FETCH_LIMIT = int(os.environ.get("GRIND_CANDLE_FETCH_LIMIT", "120"))  # 24ч*4 + запас
+
+# === Детектор разгона (1H, "медленный" путь) ===
+ROC_WINDOW_HOURS = int(os.environ.get("ROC_WINDOW_HOURS", "12"))
+BREAKOUT_LOOKBACK_HOURS = int(os.environ.get("BREAKOUT_LOOKBACK_HOURS", "72"))
+MIN_PUMP_PCT = float(os.environ.get("MIN_PUMP_PCT", "14.0"))
+MAX_PUMP_PCT = float(os.environ.get("MAX_PUMP_PCT", "250.0"))
+MIN_RVOL_1H = float(os.environ.get("MIN_RVOL_1H", "1.8"))
+BREAKOUT_TOLERANCE = float(os.environ.get("BREAKOUT_TOLERANCE", "0.985"))  # пробой с допуском 1.5%
+
+# === "Быстрый" путь — памп внутри одной НЕ закрытой 1H свечи ===
+FAST_PATH_ENABLED = os.environ.get("FAST_PATH_ENABLED", "true").lower() == "true"
+MIN_PUMP_PCT_FAST = float(os.environ.get("MIN_PUMP_PCT_FAST", "12.0"))
+MIN_RVOL_FAST = float(os.environ.get("MIN_RVOL_FAST", "3.0"))
+MIN_INTRACANDLE_VOLUME_USD = float(os.environ.get("MIN_INTRACANDLE_VOLUME_USD", "50000"))
+MIN_ELAPSED_HOURS_FAST = float(os.environ.get("MIN_ELAPSED_HOURS_FAST", "0.05"))
+
+# === "Накопление" — OI растёт, цена удерживается ===
+ACCUM_ENABLED = os.environ.get("ACCUM_ENABLED", "true").lower() == "true"
+ACCUM_WINDOW_HOURS = int(os.environ.get("ACCUM_WINDOW_HOURS", "6"))
+ACCUM_MIN_OI_GROWTH_PCT = float(os.environ.get("ACCUM_MIN_OI_GROWTH_PCT", "15.0"))
+ACCUM_MAX_PRICE_MOVE_PCT = float(os.environ.get("ACCUM_MAX_PRICE_MOVE_PCT", "6.0"))
+ACCUM_MIN_SOURCES = int(os.environ.get("ACCUM_MIN_SOURCES", "2"))
+ACCUM_COOLDOWN_SEC = int(os.environ.get("ACCUM_COOLDOWN_SEC", str(4 * 3600)))
+ACCUM_MIN_RATIO = float(os.environ.get("ACCUM_MIN_RATIO", "2.5"))
+
+# === Подтверждение на других биржах ===
+CONFIRM_PCT_RATIO = float(os.environ.get("CONFIRM_PCT_RATIO", "0.5"))
+MIN_CONFIRMATIONS = int(os.environ.get("MIN_CONFIRMATIONS", "1"))
+
+# === OI ===
+OI_MIN_GROWTH_PCT = float(os.environ.get("OI_MIN_GROWTH_PCT", "8.0"))
+OI_MIN_SOURCES = int(os.environ.get("OI_MIN_SOURCES", "1")) # Ослаблено до 1 для надежности
+
+# === Защита от повторов ===
+COOLDOWN_SEC = int(os.environ.get("COOLDOWN_SEC", str(6 * 3600)))
+REJECT_COOLDOWN_SEC = int(os.environ.get("REJECT_COOLDOWN_SEC", str(30 * 60)))
+MIN_CANDLES_NEEDED = ROC_WINDOW_HOURS + BREAKOUT_LOOKBACK_HOURS + 5
+
+CANDLE_FETCH_LIMIT = min(100, MIN_CANDLES_NEEDED + 5)
+
+KUCOIN_BASE = "https://api-futures.kucoin.com"
+BITGET_BASE = "https://api.bitget.com"
+BYBIT_BASE = "https://api.bybit.com"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("PUMP-HUNTER-v10.3")
+
+SESSION = None
+HTTP_SEMAPHORE = None
+START_TIME = time.time()
+
+UNIVERSE = {}
+LAST_SIGNAL = {}
+LAST_REJECT = {}
+ACCUM_LAST_SIGNAL = {}
+
+BITGET_OI_DIAGNOSED = set()
+
+OI_HIST_MAXLEN = int((ROC_WINDOW_HOURS + 2) * 3600 / OI_SAMPLE_INTERVAL_SEC) + 5
+OI_HISTORY = defaultdict(lambda: defaultdict(lambda: deque(maxlen=OI_HIST_MAXLEN)))
+
+STATS = {
+    "scans": 0,
+    "oi_samples": 0,
+    "pump_triggers": 0,
+    "pump_triggers_fast": 0,
+    "pump_triggers_slow": 0,
+    "pump_triggers_grind": 0,
+    "signals": 0,
+    "signals_fast": 0,
+    "signals_slow": 0,
+    "signals_grind": 0,
+    "accum_alerts": 0,
+    "rejected_no_breakout": 0,
+    "rejected_low_rvol": 0,
+    "rejected_too_late": 0,
+    "rejected_no_confirm": 0,
+    "rejected_no_oi": 0,
+}
+
+# ============================================================
+# HTTP UTILS
+# ============================================================
+
+async def http_get(url, params=None, timeout=8, retries=2):
+    if SESSION is None or SESSION.closed or HTTP_SEMAPHORE is None:
+        return None
+
+    for attempt in range(retries + 1):
+        try:
+            async with HTTP_SEMAPHORE:
+                async with SESSION.get(url, params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                    if r.status == 429:
+                        if attempt < retries:
+                            await asyncio.sleep(1.0 * (attempt + 1))
+                            continue
+                        return None
+                    if r.status >= 400:
+                        return None
+                    return await r.json(content_type=None)
+        except (asyncio.TimeoutError, aiohttp.ClientError):
+            if attempt < retries:
+                await asyncio.sleep(0.4)
+        except Exception:
+            break
+    return None
+
+
+def num(v, default=0.0):
+    try:
+        return float(v) if v is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def norm(s):
+    if not s:
+        return ""
+    s = str(s).upper()
+    if s.startswith("XBT"):
+        s = "BTC" + s[3:]
+    for suf in ("USDTM", "USDT", "-USDT", "_USDT", "PERP"):
+        if s.endswith(suf):
+            s = s[:-len(suf)]
+            break
+    return s
+
+
+# ============================================================
+# FETCHERS — Universe
+# ============================================================
+
+async def fetch_kucoin_contracts():
+    data = await http_get(f"{KUCOIN_BASE}/api/v1/contracts/active")
+    result = {}
+    if not data or not isinstance(data.get("data"), list):
+        return result
+    for row in data["data"]:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("status", "")).lower() != "open":
+            continue
+        if str(row.get("settleCurrency", "")).upper() != "USDT":
+            continue
+        symbol = str(row.get("symbol", "")).upper()
+        base = norm(row.get("baseCurrency") or symbol)
+        if not base:
+            continue
+        result[base] = {
+            "symbol": symbol,
+            "price": num(row.get("lastTradePrice") or row.get("markPrice")),
+            "volume24": num(row.get("turnoverOf24h")),
+            "change24": num(row.get("priceChgPct")) * 100,
+            "first_open_ms": num(row.get("firstOpenDate")),
+        }
+    return result
+
+
+async def fetch_bitget_tickers():
+    data = await http_get(f"{BITGET_BASE}/api/v2/mix/market/tickers", {"productType": "USDT-FUTURES"})
+    result = {}
+    if not data or data.get("code") != "00000":
+        return result
+    for row in data.get("data", []):
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol", "")).upper()
+        if symbol.endswith("USDT"):
+            base = norm(symbol)
+            if base:
+                result[base] = {"symbol": symbol}
+    return result
+
+
+# ============================================================
+# FETCHERS — candles
+# ============================================================
+
+def _parse_list_candles(rows, ts_ms=True):
+    candles = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 6:
+            continue
+        try:
+            ts, o, h, l, c, v = int(row[0]), num(row[1]), num(row[2]), num(row[3]), num(row[4]), num(row[5])
+            if o > 0 and c > 0:
+                if ts_ms and ts < 10**12:
+                    ts *= 1000
+                candles.append({"ts": ts, "open": o, "high": h, "low": l, "close": c, "volume": v})
+        except (TypeError, ValueError, IndexError):
+            continue
+    candles.sort(key=lambda x: x["ts"])
+    return candles
+
+
+async def fetch_kucoin_candles_1h(symbol):
+    now_ms = int(time.time() * 1000)
+    from_ms = now_ms - CANDLE_FETCH_LIMIT * 3600 * 1000
+    data = await http_get(f"{KUCOIN_BASE}/api/v1/kline/query", {
+        "symbol": symbol, "granularity": "60", "from": from_ms, "to": now_ms,
+    })
+    if not data or not isinstance(data.get("data"), list):
+        return []
+    return _parse_list_candles(data["data"])
+
+
+async def fetch_kucoin_candles_15m(symbol):
+    now_ms = int(time.time() * 1000)
+    from_ms = now_ms - GRIND_CANDLE_FETCH_LIMIT * 900 * 1000
+    data = await http_get(f"{KUCOIN_BASE}/api/v1/kline/query", {
+        "symbol": symbol, "granularity": "15", "from": from_ms, "to": now_ms,
+    })
+    if not data or not isinstance(data.get("data"), list):
+        return []
+    return _parse_list_candles(data["data"])
+
+
+async def fetch_bitget_candles_1h(symbol):
+    data = await http_get(f"{BITGET_BASE}/api/v2/mix/market/candles", {
+        "symbol": symbol, "productType": "USDT-FUTURES",
+        "granularity": "1H", "limit": str(CANDLE_FETCH_LIMIT),
+    })
+    if not data or data.get("code") != "00000":
+        return []
+    return _parse_list_candles(data.get("data", []), ts_ms=False)
+
+
+async def fetch_bitget_candles_15m(symbol):
+    data = await http_get(f"{BITGET_BASE}/api/v2/mix/market/candles", {
+        "symbol": symbol, "productType": "USDT-FUTURES",
+        "granularity": "15m", "limit": str(GRIND_CANDLE_FETCH_LIMIT),
+    })
+    if not data or data.get("code") != "00000":
+        return []
+    return _parse_list_candles(data.get("data", []), ts_ms=False)
+
+
+async def fetch_bybit_candles_1h(base):
+    data = await http_get(f"{BYBIT_BASE}/v5/market/kline", {
+        "category": "linear", "symbol": f"{base}USDT", "interval": "60", "limit": CANDLE_FETCH_LIMIT,
+    })
+    if not data or data.get("retCode") != 0:
+        return []
+    result = data.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("list"), list):
+        return []
+    return _parse_list_candles(result["list"], ts_ms=False)
+
+
+async def fetch_bybit_candles_15m(base):
+    data = await http_get(f"{BYBIT_BASE}/v5/market/kline", {
+        "category": "linear", "symbol": f"{base}USDT", "interval": "15", "limit": GRIND_CANDLE_FETCH_LIMIT,
+    })
+    if not data or data.get("retCode") != 0:
+        return []
+    result = data.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("list"), list):
+        return []
+    return _parse_list_candles(result["list"], ts_ms=False)
+
+
+# ============================================================
+# FETCHERS — OI (ИСПРАВЛЕН BITGET)
+# ============================================================
+
+async def fetch_kucoin_oi(symbol):
+    if not symbol:
+        return 0.0
+    data = await http_get(f"{KUCOIN_BASE}/api/v1/contracts/{symbol}")
+    if data and isinstance(data.get("data"), dict):
+        return num(data["data"].get("openInterest"))
+    return 0.0
+
+
+async def fetch_bitget_oi(symbol):
+    """Исправленный парсер OI для Bitget API v2 (учитываем openList)"""
+    if not symbol:
+        return 0.0
+    data = await http_get(f"{BITGET_BASE}/api/v2/mix/market/open-interest", {
+        "symbol": symbol, "productType": "USDT-FUTURES",
+    })
+    if not data or data.get("code") != "00000":
+        return 0.0
+        
+    raw = data.get("data")
+    if not isinstance(raw, (dict, list)):
+        return 0.0
+
+    row = {}
+    if isinstance(raw, dict):
+        # Bitget v2 использует ключ openList
+        items = raw.get("openList") or raw.get("openInterestList") or raw.get("list")
+        if isinstance(items, list) and len(items) > 0:
+            row = items[0]
+        else:
+            row = raw
+    elif isinstance(raw, list) and len(raw) > 0:
+        row = raw[0]
+
+    val = num(row.get("openInterest") or row.get("amount") or row.get("size") or row.get("openInterestUsd"))
+    return val
+
+
+async def fetch_bybit_oi(base):
+    data = await http_get(f"{BYBIT_BASE}/v5/market/open-interest", {
+        "category": "linear", "symbol": f"{base}USDT", "intervalTime": "1h", "limit": 1,
+    })
+    if not data or data.get("retCode") != 0:
+        return 0.0
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return 0.0
+    items = result.get("list")
+    if not isinstance(items, list) or not items:
+        return 0.0
+    return num(items[0].get("openInterest"))
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def calc_breakout_metrics(candles):
+    needed = ROC_WINDOW_HOURS + BREAKOUT_LOOKBACK_HOURS + 2
+    if len(candles) < needed:
+        return None
+
+    idx_now = len(candles) - 2
+    idx_past = idx_now - ROC_WINDOW_HOURS
+    if idx_past < 0:
+        return None
+
+    close_now = candles[idx_now]["close"]
+    close_past = candles[idx_past]["close"]
+    if close_past <= 0:
+        return None
+
+    pct = ((close_now / close_past) - 1) * 100
+
+    base_start = idx_now - ROC_WINDOW_HOURS - BREAKOUT_LOOKBACK_HOURS
+    base_slice = candles[max(0, base_start):idx_past]
+    if not base_slice:
+        return None
+    base_high = max(c["close"] for c in base_slice)
+    breakout = close_now > base_high * BREAKOUT_TOLERANCE
+
+    vol_now_usd = candles[idx_now]["volume"] * candles[idx_now]["close"]
+    prev_vols = [c["volume"] * c["close"] for c in candles[max(0, idx_now - 20):idx_now] if c["volume"] > 0]
+    avg_vol = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+    rvol = vol_now_usd / avg_vol if avg_vol > 0 else 0
+
+    return {
+        "close": close_now,
+        "pct": pct,
+        "breakout": breakout,
+        "base_high": base_high,
+        "rvol": rvol,
+        "volume_usd": vol_now_usd,
+    }
+
+
+def calc_intracandle_metrics(candles):
+    needed = BREAKOUT_LOOKBACK_HOURS + 3
+    if len(candles) < needed:
+        return None
+
+    idx_now = len(candles) - 1
+    current = candles[idx_now]
+    if current["open"] <= 0:
+        return None
+
+    elapsed_real = (time.time() * 1000 - current["ts"]) / 1000 / 3600
+    if elapsed_real < MIN_ELAPSED_HOURS_FAST:
+        return None
+    elapsed_hours = max(elapsed_real, 0.01)
+
+    pct = ((current["close"] / current["open"]) - 1) * 100
+
+    base_slice = candles[max(0, idx_now - BREAKOUT_LOOKBACK_HOURS):idx_now]
+    if not base_slice:
+        return None
+    base_high = max(c["close"] for c in base_slice)
+    breakout = current["close"] > base_high * BREAKOUT_TOLERANCE
+
+    vol_usd_so_far = current["volume"] * current["close"]
+    normalized_vol = vol_usd_so_far / min(elapsed_hours, 1.0)
+    prev_vols = [c["volume"] * c["close"] for c in candles[max(0, idx_now - 20):idx_now] if c["volume"] > 0]
+    avg_vol = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+    rvol = normalized_vol / avg_vol if avg_vol > 0 else 0
+
+    return {
+        "close": current["close"],
+        "pct": pct,
+        "breakout": breakout,
+        "base_high": base_high,
+        "rvol": rvol,
+        "volume_usd": vol_usd_so_far,
+        "elapsed_hours": elapsed_hours,
+    }
+
+
+def calc_grind_metrics(candles):
+    lookback_candles = GRIND_LOOKBACK_HOURS * 4
+    needed = lookback_candles + GRIND_WINDOW_CANDLES + 2
+    if len(candles) < needed:
+        return None
+
+    idx_now = len(candles) - 2  # последняя закрытая 15м свеча
+    window = candles[idx_now - GRIND_WINDOW_CANDLES + 1: idx_now + 1]
+    if len(window) < GRIND_WINDOW_CANDLES:
+        return None
+
+    ref_close = candles[idx_now - GRIND_WINDOW_CANDLES]["close"]
+    close_now = candles[idx_now]["close"]
+    if ref_close <= 0:
+        return None
+
+    pct = ((close_now / ref_close) - 1) * 100
+    green = sum(1 for c in window if c["close"] >= c["open"])
+
+    base_slice = candles[max(0, idx_now - lookback_candles): idx_now - GRIND_WINDOW_CANDLES + 1]
+    if not base_slice:
+        return None
+    base_high = max(c["close"] for c in base_slice)
+    breakout = close_now > base_high * BREAKOUT_TOLERANCE
+
+    vol_now_usd = candles[idx_now]["volume"] * candles[idx_now]["close"]
+    prev_vols = [c["volume"] * c["close"] for c in candles[max(0, idx_now - 20):idx_now] if c["volume"] > 0]
+    avg_vol = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+    rvol = vol_now_usd / avg_vol if avg_vol > 0 else 0
+
+    return {
+        "close": close_now,
+        "pct": pct,
+        "breakout": breakout,
+        "base_high": base_high,
+        "rvol": rvol,
+        "volume_usd": vol_now_usd,
+        "green": green,
+        "elapsed_hours": GRIND_WINDOW_CANDLES * 0.25,
+    }
+
+
+def oi_growth_pct(base, exchange, window_hours=None):
+    if window_hours is None:
+        window_hours = ROC_WINDOW_HOURS
+    hist = OI_HISTORY[base][exchange]
+    if len(hist) < 2:
+        return None
+
+    now_ts, now_oi = hist[-1]
+    if now_ts - hist[0][0] < window_hours * 3600 * 0.8:
+        return None
+
+    target_ts = time.time() - window_hours * 3600
+    past = None
+    for ts, val in hist:
+        if ts <= target_ts:
+            past = (ts, val)
+        else:
+            break
+    if past is None:
+        past = hist[0]
+    past_ts, past_oi = past
+    if past_oi <= 0:
+        return None
+    return ((now_oi / past_oi) - 1) * 100
+
+
+def calc_accumulation(base, kc_candles):
+    needed = ACCUM_WINDOW_HOURS + 2
+    if len(kc_candles) < needed:
+        return None
+
+    idx_start = max(0, len(kc_candles) - 1 - ACCUM_WINDOW_HOURS)
+    start_close = kc_candles[idx_start]["close"]
+    now_close = kc_candles[-1]["close"]  # живая цена
+    if start_close <= 0:
+        return None
+
+    price_change_pct = abs((now_close - start_close) / start_close) * 100
+    if price_change_pct > ACCUM_MAX_PRICE_MOVE_PCT:
+        return None
+
+    oi_deltas = {}
+    growing_sources = 0
+    max_oi_delta = 0.0
+
+    for exch in ("kucoin", "bitget", "bybit"):
+        d = oi_growth_pct(base, exch, ACCUM_WINDOW_HOURS)
+        oi_deltas[exch] = d if d is not None else 0.0
+        if d is not None and d >= ACCUM_MIN_OI_GROWTH_PCT:
+            growing_sources += 1
+            if d > max_oi_delta:
+                max_oi_delta = d
+
+    if growing_sources < ACCUM_MIN_SOURCES:
+        return None
+
+    safe_price_change = max(price_change_pct, 0.5)
+    oi_to_price_ratio = max_oi_delta / safe_price_change
+
+    if oi_to_price_ratio < ACCUM_MIN_RATIO:
+        return None
+
+    return {
+        "price_change_pct": price_change_pct,
+        "oi_to_price_ratio": oi_to_price_ratio,
+        "oi_deltas": oi_deltas,
+        "growing_sources": growing_sources,
+        "close": now_close,
+    }
+
+
+# ============================================================
+# TELEGRAM MESSAGING
+# ============================================================
+
+async def send_tg(text):
+    if not BOT_TOKEN or not CHAT_ID or SESSION is None:
+        return False
+    try:
+        async with SESSION.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": CHAT_ID, "text": text,
+                "parse_mode": "HTML", "disable_web_page_preview": True,
+            },
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as r:
+            if r.status != 200:
+                ret
